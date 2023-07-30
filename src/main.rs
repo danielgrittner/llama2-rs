@@ -228,6 +228,10 @@ impl TransformerWeights {
     }
 }
 
+struct RunState {
+    // TODO:
+}
+
 fn main() -> Result<()> {
     let file_path = "weights/stories15M.bin";
 
