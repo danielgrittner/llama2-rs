@@ -11,6 +11,7 @@ struct Config {
     hidden_dim: usize, // for ffn layers
     n_layers: usize,   // number of layers
     n_heads: usize,    // number of query heads
+    head_size: usize, // size of each head (dim / n_heads)
     n_kv_heads: usize, // number of key/value heads
     shared_weights: bool,
     vocab_size: usize, // vocabulary size
@@ -43,6 +44,7 @@ impl Config {
             hidden_dim: raw_config[1] as usize,
             n_layers: raw_config[2] as usize,
             n_heads: raw_config[3] as usize,
+            head_size: (raw_config[0] as usize) / (raw_config[3] as usize),
             n_kv_heads: raw_config[4] as usize,
             shared_weights: raw_config[5] > 0, // weird hack from Andrej
             vocab_size: raw_config[5].abs() as usize,
@@ -117,7 +119,7 @@ struct TransformerWeights {
     freq_cis_real: Vec<f32>, // (seq_len, dim/2) TODO: the comment says that this is dim/2, but the code says head_size/2 where head_size = dim / n_heads???
     freq_cis_imag: Vec<f32>, // (seq_len, dim/2)
     // (optional) classifier weights for the logits, on the last layer
-    wcls: Vec<f32>,
+    wcls: Vec<f32>, // (vocab_size, dim)
 }
 
 fn byte_chunk_to_vec<T>(byte_chunk: &[u8], number_elements: usize) -> Vec<T>
@@ -191,13 +193,11 @@ impl TransformerWeights {
         offset += rms_final_weights_size * std::mem::size_of::<f32>();
 
         // Read the freq_cis for RoPE relatively positional embeddings
-        let head_size = config.dim / config.n_heads;
-
-        let freq_cis_real_size = config.seq_len * head_size / 2;
+        let freq_cis_real_size = config.seq_len * config.head_size / 2;
         let freq_cis_real: Vec<f32> = byte_chunk_to_vec(&mmap[offset..], freq_cis_real_size);
         offset += freq_cis_real_size * std::mem::size_of::<f32>();
 
-        let freq_cis_imag_size = config.seq_len * head_size / 2;
+        let freq_cis_imag_size = config.seq_len * config.head_size / 2;
         let freq_cis_imag: Vec<f32> = byte_chunk_to_vec(&mmap[offset..], freq_cis_imag_size);
         offset += freq_cis_imag_size * std::mem::size_of::<f32>();
 
@@ -228,8 +228,233 @@ impl TransformerWeights {
     }
 }
 
-struct RunState {
-    // TODO:
+// TODO: I think passing the size as parameter is not necessary since slice supports len()
+
+// F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+fn add_vectors(target: &mut [f32], source: &[f32], n: usize) {
+    for i in 0..n {
+        target[i] += source[i];
+    }
+}
+
+fn rmsnorm(x: &mut [f32], weight: &[f32], n: usize) {
+    let mut squared_sum = 0.0;
+    for i in 0..n {
+        squared_sum += x[i] * x[i];
+    }
+    let rms = 1. / (squared_sum / n as f32).sqrt();
+
+    for i in 0..n {
+        x[i] = x[i] * rms * weight[i];
+    }
+}
+
+fn rmsnorm_with_dest(dest: &mut [f32], x: &[f32], weight: &[f32], n: usize) {
+    let mut squared_sum = 0.0;
+    for i in 0..n {
+        squared_sum += x[i] * x[i];
+    }
+    let rms = 1. / (squared_sum / n as f32).sqrt();
+
+    for i in 0..n {
+        dest[i] = x[i] * rms * weight[i];
+    }
+}
+
+fn softmax(logits: &mut [f32], n: usize) {
+    // Find max. for fixing stability
+    let mut max_logit = std::f32::MIN;
+    for i in 0..n {
+        max_logit = max_logit.max(logits[i]);
+    }
+
+    // Exponentiate and sum logits
+    let mut sum = 0.0;
+    for i in 0..n {
+        logits[i] = (logits[i] - max_logit).exp();
+        sum += logits[i];
+    }
+
+    // Normalize
+    for i in 0..n {
+        logits[i] /= sum;
+    }
+}
+
+// TODO: rename n to out_dim and d to in_dim
+// (n, d) @ (d,) -> (n,)
+// w @ x -> target
+fn matmul(target: &mut [f32], w: &[f32], x: &[f32], n: usize, d: usize) {
+    // TODO: switch to iterator implementation, then parallelize the outer loop
+    for i in 0..n {
+        target[i] = 0.0;
+        let row_offset = i * n;
+        for j in 0..d {
+            target[i] += w[row_offset + j] * x[j];
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LLaMA2<'a> {
+    // buffers for current activations
+    x: Vec<f32>,      // activation at current timestep (dim,)
+    xb: Vec<f32>,     // same, but inside a residual branch (dim,)
+    xb2: Vec<f32>,    // additional buffer (dim,)
+    hb: Vec<f32>,     // buffer for hidden dimension in the ffn (hidden_dim,)
+    hb2: Vec<f32>,    // buffer for hidden dimension in the ffn (hidden_dim,)
+    q: Vec<f32>,      // query (dim,)
+    k: Vec<f32>,      // key (dim,)
+    v: Vec<f32>,      // value (dim,)
+    att: Vec<f32>,    // attention scores (n_heads, seq_len)
+    logits: Vec<f32>, // output logits (vocab_size,)
+    // kv cache
+    key_cache: Vec<f32>,   // (n_kv_heads, seq_len, dim)
+    value_cache: Vec<f32>, // (n_kv_heads, seq_len, dim)
+    // weights & config
+    transformer: &'a TransformerWeights,
+    config: &'a Config,
+}
+
+impl<'a> LLaMA2<'a> {
+    fn new(transformer: &'a TransformerWeights, config: &'a Config) -> LLaMA2<'a> {
+        Self {
+            x: vec![0.0; config.dim],
+            xb: vec![0.0; config.dim],
+            xb2: vec![0.0; config.dim],
+            hb: vec![0.0; config.hidden_dim],
+            hb2: vec![0.0; config.hidden_dim],
+            q: vec![0.0; config.dim],
+            k: vec![0.0; config.dim],
+            v: vec![0.0; config.dim],
+            att: vec![0.0; config.n_heads * config.seq_len],
+            logits: vec![0.0; config.vocab_size],
+            key_cache: vec![0.0; config.n_kv_heads * config.seq_len * config.dim],
+            value_cache: vec![0.0; config.n_kv_heads * config.seq_len * config.dim],
+            transformer,
+            config,
+        }
+    }
+
+    // multi-head attention with RoPE
+    fn attn(&mut self, layer: usize, pos: usize) {
+        // TODO: implement multi-head attention with RoPE
+    }
+
+    // PyTorch: self.w2(F.silu(self.w1(x)) * self.w3(x))
+    fn ffn(&mut self, layer: usize) {
+        let weight_from = layer * self.config.hidden_dim * self.config.dim;
+        let weight_to = (layer + 1) * self.config.hidden_dim * self.config.dim;
+
+        // PyTorch: self.w1(x)
+        matmul(
+            self.hb.as_mut_slice(), // out: (hidden_dim,)
+            &self.transformer.w1[weight_from..weight_to], // W: (hidden_dim, dim)
+            self.xb.as_slice(), // x: (dim,)
+            self.config.hidden_dim,
+            self.config.dim
+        );
+
+        // PyTorch: self.w3(x)
+        matmul(
+            self.hb2.as_mut_slice(), // out: (hidden_dim,)
+            &self.transformer.w3[weight_from..weight_to], // W: (hidden_dim, dim)
+            self.xb.as_slice(), // x: (dim,)
+            self.config.hidden_dim,
+            self.config.dim
+        );
+
+        // PyTorch: x = F.silu(self.w1(x)) * self.w3(x)
+        // Note: Fused the activation and elementwise multiplication loop
+        for i in 0..self.config.hidden_dim {
+            self.hb[i] = silu(self.hb[i]) * self.hb2[i];
+        }
+
+        // PyTorch: self.w2(x)
+        matmul(
+            self.xb.as_mut_slice(), // out: (hidden_dim,)
+            &self.transformer.w2[weight_from..weight_to], // W: (hidden_dim, dim)
+            self.hb.as_slice(), // x: (dim,)
+            self.config.dim,
+            self.config.hidden_dim
+        );
+    }
+
+    fn layer(&mut self, layer: usize, pos: usize) {
+        // PyTorch: h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cis, mask)
+        // Note: we leave the buffer x as it is because we need it for the residual connection
+        rmsnorm_with_dest(
+            self.xb.as_mut_slice(),
+            self.x.as_slice(),
+            &self.transformer.rms_ffn_weight[layer * self.config.dim..(layer + 1) * self.config.dim],
+            self.config.dim
+        );
+        self.attn(layer, pos);
+        // residual connection
+        add_vectors(
+            self.x.as_mut_slice(),
+            self.xb.as_slice(),
+            self.config.dim
+        );
+
+        // PyTorch: out = h + self.feed_forward.forward(self.ffn_norm(h))
+        // Note: we leave the buffer x as it is because we need it for the residual connection
+        rmsnorm_with_dest(
+            self.xb.as_mut_slice(),
+            self.x.as_slice(),
+            &self.transformer.rms_ffn_weight[layer * self.config.dim..(layer + 1) * self.config.dim],
+            self.config.dim
+        );
+        self.ffn(layer);
+        // residual connection
+        add_vectors(
+            self.x.as_mut_slice(),
+            self.xb.as_slice(),
+            self.config.dim
+        );
+    }
+
+    fn forward(&mut self, token: usize, pos: usize) {
+        // fetch the token embedding
+        // PyTorch: h = self.tok_embeddings(tokens)
+        self.x.copy_from_slice(
+            &self
+                .transformer
+                .token_embedding_table[(token * self.config.dim)..((token + 1) * self.config.dim)]
+        );
+
+        // Note: here it always holds that seqlen == 1 in comparison to the PyTorch implementation
+
+        // forward through the layers
+        // PyTorch:
+        // for layer in self.layers:
+        //     h = layer(h, start_pos, freqs_cis, mask)
+        for l in 0..self.config.n_layers {
+            self.layer(l, pos);
+        }
+
+        // final RMSNorm
+        // PyTorch: h = self.norm(h)
+        rmsnorm(
+            self.x.as_mut_slice(),
+            self.transformer.rms_final_weights.as_slice(),
+            self.config.dim
+        );
+
+        // generate logits, i.e., map activations from dim to vocab_size
+        // PyTorch: output = self.output(h).float()
+        matmul(
+            self.logits.as_mut_slice(), // out: (vocab_size,)
+            self.transformer.wcls.as_slice(), // W: (vocab_size, dim)
+            self.x.as_slice(), // x: (dim,)
+            self.config.vocab_size,
+            self.config.dim
+        );
+    }
 }
 
 fn main() -> Result<()> {
@@ -247,7 +472,6 @@ fn main() -> Result<()> {
 
     println!("Done.");
 
-    
     // TODO: set up inference state
 
     // TODO: forward pass
