@@ -285,15 +285,14 @@ fn softmax(logits: &mut [f32], n: usize) {
     }
 }
 
-// TODO: rename n to out_dim and d to in_dim
-// (n, d) @ (d,) -> (n,)
+// (out_dim, in_dim) @ (d,) -> (out_dim,)
 // w @ x -> target
-fn matmul(target: &mut [f32], w: &[f32], x: &[f32], n: usize, d: usize) {
+fn matmul(target: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
     // TODO: switch to iterator implementation, then parallelize the outer loop
-    for i in 0..n {
+    for i in 0..out_dim {
         target[i] = 0.0;
-        let row_offset = i * n;
-        for j in 0..d {
+        let row_offset = i * out_dim;
+        for j in 0..in_dim {
             target[i] += w[row_offset + j] * x[j];
         }
     }
@@ -340,8 +339,79 @@ impl<'a> LLaMA2<'a> {
         }
     }
 
+    // PyTorch: xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+    fn attn_qkv_matmuls(&mut self, layer: usize) {
+        let weight_from = layer * self.config.dim * self.config.dim;
+        let weight_to = (layer + 1) * self.config.dim * self.config.dim;
+        
+        matmul(
+            self.q.as_mut_slice(), // out: (dim,)
+            &self.transformer.wq[weight_from..weight_to], // W: (dim, dim)
+            self.xb.as_slice(), // x: (dim,)
+            self.config.dim,
+            self.config.dim
+        );
+
+        matmul(
+            self.k.as_mut_slice(), // out: (dim,)
+            &self.transformer.wk[weight_from..weight_to], // W: (dim, dim)
+            self.xb.as_slice(), // x: (dim,)
+            self.config.dim,
+            self.config.dim
+        );
+
+        matmul(
+            self.v.as_mut_slice(), // out: (dim,)
+            &self.transformer.wv[weight_from..weight_to], // W: (dim, dim)
+            self.xb.as_slice(), // x: (dim,)
+            self.config.dim,
+            self.config.dim
+        );
+    }
+
+    fn attn_rope(&mut self, layer: usize, pos: usize) {
+        // apply RoPE rotation to the q and k vectors for each head
+
+        let freq_cis_real_offset = pos * self.config.head_size / 2;
+        let freq_cis_imag_offset = pos * self.config.head_size / 2;
+        
+        for h in 0..self.config.n_heads {
+            let q = &mut self.q[h * self.config.head_size..];
+            let k = &mut self.k[h * self.config.head_size..];
+
+            // rotate q and k by the freq_cis_real and freq_cis_imag
+            // For more information checkout the Roformer paper,
+            // section 3.4.2: https://arxiv.org/pdf/2104.09864.pdf
+            for i in (0..self.config.head_size).step_by(2) {
+                let cos = self.transformer.freq_cis_real[freq_cis_real_offset + i / 2];
+                let sin = self.transformer.freq_cis_imag[freq_cis_imag_offset + i / 2];
+                
+                // Query vector
+                let q0 = q[i];
+                let q1 = q[i + 1];
+
+                q[i] = q0 * cos - q1 * sin;
+                q[i + 1] = q1 * cos + q0 * sin;
+
+                // Key vector
+                let k0 = k[i];
+                let k1 = k[i + 1];
+
+                k[i] = k0 * cos - k1 * sin;
+                k[i + 1] = k1 * cos + k0 * sin;
+            }
+        }
+    }
+
     // multi-head attention with RoPE
     fn attn(&mut self, layer: usize, pos: usize) {
+        // qkv matmuls
+        // PyTorch: xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        self.attn_qkv_matmuls(layer);
+        
+        // apply RoPE rotation to the q and k vectors for each head
+        self.attn_rope(layer, pos);
+        
         // TODO: implement multi-head attention with RoPE
     }
 
@@ -370,6 +440,7 @@ impl<'a> LLaMA2<'a> {
 
         // PyTorch: x = F.silu(self.w1(x)) * self.w3(x)
         // Note: Fused the activation and elementwise multiplication loop
+        // TODO: benchmark in llama2.c the effect of this loop fusion
         for i in 0..self.config.hidden_dim {
             self.hb[i] = silu(self.hb[i]) * self.hb2[i];
         }
