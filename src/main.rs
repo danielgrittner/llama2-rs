@@ -288,14 +288,14 @@ fn softmax(logits: &mut [f32], n: usize) {
 // (out_dim, in_dim) @ (d,) -> (out_dim,)
 // w @ x -> target
 fn matmul(target: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
-    // TODO: switch to iterator implementation, then parallelize the outer loop
-    for i in 0..out_dim {
+    // TODO: parallelize loop
+    (0..out_dim).into_iter().for_each(|i| {
         target[i] = 0.0;
         let row_offset = i * out_dim;
         for j in 0..in_dim {
             target[i] += w[row_offset + j] * x[j];
         }
-    }
+    });
 }
 
 #[derive(Debug)]
@@ -403,6 +403,13 @@ impl<'a> LLaMA2<'a> {
         }
     }
 
+    fn multihead_attn(&mut self, layer: usize) {
+        // TODO: parallelize loop
+        (0..self.config.n_heads).into_iter().for_each(|h| {
+            // TODO: attention
+        });
+    }
+
     // multi-head attention with RoPE
     fn attn(&mut self, layer: usize, pos: usize) {
         // qkv matmuls
@@ -412,7 +419,22 @@ impl<'a> LLaMA2<'a> {
         // apply RoPE rotation to the q and k vectors for each head
         self.attn_rope(layer, pos);
         
-        // TODO: implement multi-head attention with RoPE
+        // TODO: caching
+
+        // Multi-head attention
+        self.multihead_attn(layer);
+
+        // Map attention scores to logits
+        // PyTorch: x = self.wo(x)
+        let weight_from = layer * self.config.dim * self.config.dim;
+        let weight_to = (layer + 1) * self.config.dim * self.config.dim;
+        matmul(
+            self.xb2.as_mut_slice(), // out: (dim,)
+            &self.transformer.wo[weight_from..weight_to], // W: (dim, dim)
+            self.xb.as_slice(), // x: (dim,)
+            self.config.dim,
+            self.config.dim
+        );
     }
 
     // PyTorch: self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -468,7 +490,7 @@ impl<'a> LLaMA2<'a> {
         // residual connection
         add_vectors(
             self.x.as_mut_slice(),
-            self.xb.as_slice(),
+            self.xb2.as_slice(),
             self.config.dim
         );
 
