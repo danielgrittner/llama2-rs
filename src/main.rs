@@ -2,6 +2,7 @@ use byteorder::ByteOrder;
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{BufReader, Read, Result};
+use std::iter::zip;
 
 type RawConfigI32 = [i32; 7];
 
@@ -11,7 +12,7 @@ struct Config {
     hidden_dim: usize, // for ffn layers
     n_layers: usize,   // number of layers
     n_heads: usize,    // number of query heads
-    head_size: usize, // size of each head (dim / n_heads)
+    head_size: usize,  // size of each head (dim / n_heads)
     n_kv_heads: usize, // number of key/value heads
     shared_weights: bool,
     vocab_size: usize, // vocabulary size
@@ -298,6 +299,10 @@ fn matmul(target: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usiz
     });
 }
 
+fn inner_product(x: &[f32], y: &[f32]) -> f32 {
+    zip(x, y).fold(0.0, |acc, (a, b)| acc + a * b)
+}
+
 #[derive(Debug)]
 struct LLaMA2<'a> {
     // buffers for current activations
@@ -312,8 +317,8 @@ struct LLaMA2<'a> {
     att: Vec<f32>,    // attention scores (n_heads, seq_len)
     logits: Vec<f32>, // output logits (vocab_size,)
     // kv cache
-    key_cache: Vec<f32>,   // (n_kv_heads, seq_len, dim)
-    value_cache: Vec<f32>, // (n_kv_heads, seq_len, dim)
+    key_cache: Vec<f32>,   // (layer, seq_len, dim)
+    value_cache: Vec<f32>, // (layer, seq_len, dim)
     // weights & config
     transformer: &'a TransformerWeights,
     config: &'a Config,
@@ -343,29 +348,29 @@ impl<'a> LLaMA2<'a> {
     fn attn_qkv_matmuls(&mut self, layer: usize) {
         let weight_from = layer * self.config.dim * self.config.dim;
         let weight_to = (layer + 1) * self.config.dim * self.config.dim;
-        
+
         matmul(
-            self.q.as_mut_slice(), // out: (dim,)
+            self.q.as_mut_slice(),                        // out: (dim,)
             &self.transformer.wq[weight_from..weight_to], // W: (dim, dim)
-            self.xb.as_slice(), // x: (dim,)
+            self.xb.as_slice(),                           // x: (dim,)
             self.config.dim,
-            self.config.dim
+            self.config.dim,
         );
 
         matmul(
-            self.k.as_mut_slice(), // out: (dim,)
+            self.k.as_mut_slice(),                        // out: (dim,)
             &self.transformer.wk[weight_from..weight_to], // W: (dim, dim)
-            self.xb.as_slice(), // x: (dim,)
+            self.xb.as_slice(),                           // x: (dim,)
             self.config.dim,
-            self.config.dim
+            self.config.dim,
         );
 
         matmul(
-            self.v.as_mut_slice(), // out: (dim,)
+            self.v.as_mut_slice(),                        // out: (dim,)
             &self.transformer.wv[weight_from..weight_to], // W: (dim, dim)
-            self.xb.as_slice(), // x: (dim,)
+            self.xb.as_slice(),                           // x: (dim,)
             self.config.dim,
-            self.config.dim
+            self.config.dim,
         );
     }
 
@@ -374,7 +379,7 @@ impl<'a> LLaMA2<'a> {
 
         let freq_cis_real_offset = pos * self.config.head_size / 2;
         let freq_cis_imag_offset = pos * self.config.head_size / 2;
-        
+
         for h in 0..self.config.n_heads {
             let q = &mut self.q[h * self.config.head_size..];
             let k = &mut self.k[h * self.config.head_size..];
@@ -385,7 +390,7 @@ impl<'a> LLaMA2<'a> {
             for i in (0..self.config.head_size).step_by(2) {
                 let cos = self.transformer.freq_cis_real[freq_cis_real_offset + i / 2];
                 let sin = self.transformer.freq_cis_imag[freq_cis_imag_offset + i / 2];
-                
+
                 // Query vector
                 let q0 = q[i];
                 let q1 = q[i + 1];
@@ -403,10 +408,66 @@ impl<'a> LLaMA2<'a> {
         }
     }
 
-    fn multihead_attn(&mut self, layer: usize) {
+    fn cache_kv(&mut self, layer: usize, pos: usize) {
+        // cache the key, value for the current timestep (pos)
+        let layer_offset = layer * self.config.seq_len * self.config.dim; // offset to get to the cache of the current layer
+        let cache_from = layer_offset + pos * self.config.dim;
+        let cache_to = layer_offset + (pos + 1) * self.config.dim;
+
+        self.key_cache[cache_from..cache_to].copy_from_slice(&self.k.as_slice());
+        self.value_cache[cache_from..cache_to].copy_from_slice(&self.v.as_slice());
+    }
+
+    fn multihead_attn(&mut self, layer: usize, pos: usize) {
+        let layer_offset_for_cache = layer * self.config.seq_len * self.config.dim; // offset to get to the cache of the current layer
+        
+        let sqrt_d = (self.config.head_size as f32).sqrt();
+        
         // TODO: parallelize loop
         (0..self.config.n_heads).into_iter().for_each(|h| {
-            // TODO: attention
+            // get reference to the attention scores slice for the current head
+            let attn_scores_from = h * self.config.seq_len;
+            let attn_scores_to = (h + 1) * self.config.seq_len;
+            let mut attn_scores = &mut self.att[attn_scores_from..attn_scores_to];
+
+            // get query vector of the timestep pos for the current head
+            let q_from = h * self.config.head_size;
+            let q_to = (h + 1) * self.config.head_size;
+            let q = &self.q[q_from..q_to];
+
+            // Compute temp = (K * q_pos) / sqrt(dim)
+            for t in 0..=pos {
+                let timestep_and_layer_offset = layer_offset_for_cache + t * self.config.dim; // key_cache[l, t]
+                // for the current key, we need to select the correct range which corresponds to the current head
+                let key_vector_from = timestep_and_layer_offset + h * self.config.head_size;
+                let key_vector_to = timestep_and_layer_offset + (h + 1) * self.config.head_size;
+                let key_vector = &self.key_cache[key_vector_from..key_vector_to];
+
+                attn_scores[t] = inner_product(q, key_vector) / sqrt_d;
+            }
+
+            // Compute temp2 = softmax(temp)
+            softmax(&mut attn_scores, self.config.head_size);
+
+            // Compute temp2^T * V
+            let xb_from = h * self.config.head_size;
+            let xb_to = (h + 1) * self.config.head_size;
+            let xb = &mut self.xb[xb_from..xb_to];
+            xb.fill(0.0);
+
+            for t in 0..=pos {
+                let timestep_and_layer_offset = layer_offset_for_cache + t * self.config.dim; // value_cache[l, t]
+                // for the current value, we need to select the correct range which corresponds to the current head
+                let value_vector_from = timestep_and_layer_offset + h * self.config.head_size;
+                let value_vector_to = timestep_and_layer_offset + (h + 1) * self.config.head_size;
+                let value_vector = &self.value_cache[value_vector_from..value_vector_to];
+
+                // weighted sum with attention scores as weights
+                let attention_weight = attn_scores[t];
+                for i in 0..self.config.head_size {
+                    xb[i] += attention_weight * value_vector[i];
+                }
+            }
         });
     }
 
@@ -415,25 +476,37 @@ impl<'a> LLaMA2<'a> {
         // qkv matmuls
         // PyTorch: xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         self.attn_qkv_matmuls(layer);
-        
+
         // apply RoPE rotation to the q and k vectors for each head
         self.attn_rope(layer, pos);
-        
-        // TODO: caching
 
-        // Multi-head attention
-        self.multihead_attn(layer);
+        // Multi-head attention with caching
+        // Idea:
+        // 
+        // Let the current sequence length until the current timestep pos be n.
+        // The idea is to only compute the attention score for the token at timestep pos.
+        // Therefore, we compute for each head:
+        //
+        //              attn_pos = softmax((K * q_pos) / sqrt(dim))^T * V
+        //
+        //  where
+        //      - attn_pos: attention score for timestep pos. dim(head_size,)
+        //      - q_pos: query vector for timestep pos. dim(head_size,)
+        //      - K/V: key/value vectors for all timesteps up to n. dim(n,head_size)
+        //          ==> this is also the reason why we need the caching, to store all the previous key/value vectors
+        self.cache_kv(layer, pos);
+        self.multihead_attn(layer, pos);
 
         // Map attention scores to logits
         // PyTorch: x = self.wo(x)
         let weight_from = layer * self.config.dim * self.config.dim;
         let weight_to = (layer + 1) * self.config.dim * self.config.dim;
         matmul(
-            self.xb2.as_mut_slice(), // out: (dim,)
+            self.xb2.as_mut_slice(),                      // out: (dim,)
             &self.transformer.wo[weight_from..weight_to], // W: (dim, dim)
-            self.xb.as_slice(), // x: (dim,)
+            self.xb.as_slice(),                           // x: (dim,)
             self.config.dim,
-            self.config.dim
+            self.config.dim,
         );
     }
 
@@ -444,20 +517,20 @@ impl<'a> LLaMA2<'a> {
 
         // PyTorch: self.w1(x)
         matmul(
-            self.hb.as_mut_slice(), // out: (hidden_dim,)
+            self.hb.as_mut_slice(),                       // out: (hidden_dim,)
             &self.transformer.w1[weight_from..weight_to], // W: (hidden_dim, dim)
-            self.xb.as_slice(), // x: (dim,)
+            self.xb.as_slice(),                           // x: (dim,)
             self.config.hidden_dim,
-            self.config.dim
+            self.config.dim,
         );
 
         // PyTorch: self.w3(x)
         matmul(
-            self.hb2.as_mut_slice(), // out: (hidden_dim,)
+            self.hb2.as_mut_slice(),                      // out: (hidden_dim,)
             &self.transformer.w3[weight_from..weight_to], // W: (hidden_dim, dim)
-            self.xb.as_slice(), // x: (dim,)
+            self.xb.as_slice(),                           // x: (dim,)
             self.config.hidden_dim,
-            self.config.dim
+            self.config.dim,
         );
 
         // PyTorch: x = F.silu(self.w1(x)) * self.w3(x)
@@ -469,11 +542,11 @@ impl<'a> LLaMA2<'a> {
 
         // PyTorch: self.w2(x)
         matmul(
-            self.xb.as_mut_slice(), // out: (hidden_dim,)
+            self.xb.as_mut_slice(),                       // out: (hidden_dim,)
             &self.transformer.w2[weight_from..weight_to], // W: (hidden_dim, dim)
-            self.hb.as_slice(), // x: (dim,)
+            self.hb.as_slice(),                           // x: (dim,)
             self.config.dim,
-            self.config.hidden_dim
+            self.config.hidden_dim,
         );
     }
 
@@ -483,41 +556,34 @@ impl<'a> LLaMA2<'a> {
         rmsnorm_with_dest(
             self.xb.as_mut_slice(),
             self.x.as_slice(),
-            &self.transformer.rms_ffn_weight[layer * self.config.dim..(layer + 1) * self.config.dim],
-            self.config.dim
+            &self.transformer.rms_ffn_weight
+                [layer * self.config.dim..(layer + 1) * self.config.dim],
+            self.config.dim,
         );
         self.attn(layer, pos);
         // residual connection
-        add_vectors(
-            self.x.as_mut_slice(),
-            self.xb2.as_slice(),
-            self.config.dim
-        );
+        add_vectors(self.x.as_mut_slice(), self.xb2.as_slice(), self.config.dim);
 
         // PyTorch: out = h + self.feed_forward.forward(self.ffn_norm(h))
         // Note: we leave the buffer x as it is because we need it for the residual connection
         rmsnorm_with_dest(
             self.xb.as_mut_slice(),
             self.x.as_slice(),
-            &self.transformer.rms_ffn_weight[layer * self.config.dim..(layer + 1) * self.config.dim],
-            self.config.dim
+            &self.transformer.rms_ffn_weight
+                [layer * self.config.dim..(layer + 1) * self.config.dim],
+            self.config.dim,
         );
         self.ffn(layer);
         // residual connection
-        add_vectors(
-            self.x.as_mut_slice(),
-            self.xb.as_slice(),
-            self.config.dim
-        );
+        add_vectors(self.x.as_mut_slice(), self.xb.as_slice(), self.config.dim);
     }
 
     fn forward(&mut self, token: usize, pos: usize) {
         // fetch the token embedding
         // PyTorch: h = self.tok_embeddings(tokens)
         self.x.copy_from_slice(
-            &self
-                .transformer
-                .token_embedding_table[(token * self.config.dim)..((token + 1) * self.config.dim)]
+            &self.transformer.token_embedding_table
+                [(token * self.config.dim)..((token + 1) * self.config.dim)],
         );
 
         // Note: here it always holds that seqlen == 1 in comparison to the PyTorch implementation
@@ -535,17 +601,17 @@ impl<'a> LLaMA2<'a> {
         rmsnorm(
             self.x.as_mut_slice(),
             self.transformer.rms_final_weights.as_slice(),
-            self.config.dim
+            self.config.dim,
         );
 
         // generate logits, i.e., map activations from dim to vocab_size
         // PyTorch: output = self.output(h).float()
         matmul(
-            self.logits.as_mut_slice(), // out: (vocab_size,)
+            self.logits.as_mut_slice(),       // out: (vocab_size,)
             self.transformer.wcls.as_slice(), // W: (vocab_size, dim)
-            self.x.as_slice(), // x: (dim,)
+            self.x.as_slice(),                // x: (dim,)
             self.config.vocab_size,
-            self.config.dim
+            self.config.dim,
         );
     }
 }
