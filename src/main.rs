@@ -120,8 +120,8 @@ struct TransformerWeights {
     // final RMSNorm
     rms_final_weights: Vec<f32>, // (dim)
     // freq_cis for RoPE relatively positional embeddings
-    freq_cis_real: Vec<f32>, // (seq_len, dim/2) TODO: the comment says that this is dim/2, but the code says head_size/2 where head_size = dim / n_heads???
-    freq_cis_imag: Vec<f32>, // (seq_len, dim/2)
+    freq_cis_real: Vec<f32>, // (seq_len, head_size/2)
+    freq_cis_imag: Vec<f32>, // (seq_len, head_size/2)
     // (optional) classifier weights for the logits, on the last layer
     wcls: Vec<f32>, // (vocab_size, dim)
 }
@@ -143,7 +143,7 @@ impl TransformerWeights {
         let file = File::open(weights_file_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        let mut offset = std::mem::size_of::<Config>();
+        let mut offset = std::mem::size_of::<RawConfigI32>();
 
         // Read the weights
         let token_embedding_table_size = config.vocab_size * config.dim;
@@ -151,14 +151,10 @@ impl TransformerWeights {
             byte_chunk_to_vec(&mmap[offset..], token_embedding_table_size);
         offset += token_embedding_table_size * std::mem::size_of::<f32>();
 
-        // Read the RMSNorm weights
+        // Read the RMSNorm weights for attention
         let rms_att_weight_size = config.n_layers * config.dim;
         let rms_att_weight: Vec<f32> = byte_chunk_to_vec(&mmap[offset..], rms_att_weight_size);
         offset += rms_att_weight_size * std::mem::size_of::<f32>();
-
-        let rms_ffn_weight_size = config.n_layers * config.dim;
-        let rms_ffn_weight: Vec<f32> = byte_chunk_to_vec(&mmap[offset..], rms_ffn_weight_size);
-        offset += rms_ffn_weight_size * std::mem::size_of::<f32>();
 
         // Read the attention weights
         let wq_size = config.n_layers * config.dim * config.dim;
@@ -176,6 +172,11 @@ impl TransformerWeights {
         let wo_size = config.n_layers * config.dim * config.dim;
         let wo: Vec<f32> = byte_chunk_to_vec(&mmap[offset..], wo_size);
         offset += wo_size * std::mem::size_of::<f32>();
+
+        // Read the RMSNorm weights for ffn
+        let rms_ffn_weight_size = config.n_layers * config.dim;
+        let rms_ffn_weight: Vec<f32> = byte_chunk_to_vec(&mmap[offset..], rms_ffn_weight_size);
+        offset += rms_ffn_weight_size * std::mem::size_of::<f32>();
 
         // Read the ffn weights
         let w1_size = config.n_layers * config.hidden_dim * config.dim;
@@ -262,7 +263,7 @@ fn rmsnorm_with_dest(dest: &mut [f32], x: &[f32], weight: &[f32], n: usize) {
     for i in 0..n {
         squared_sum += x[i] * x[i];
     }
-    let rms = 1. / (squared_sum / n as f32).sqrt();
+    let rms = 1. / (squared_sum / n as f32 + 1e-5 as f32).sqrt();
 
     for i in 0..n {
         dest[i] = x[i] * rms * weight[i];
@@ -271,8 +272,8 @@ fn rmsnorm_with_dest(dest: &mut [f32], x: &[f32], weight: &[f32], n: usize) {
 
 fn softmax(logits: &mut [f32], n: usize) {
     // Find max. for fixing stability
-    let mut max_logit = std::f32::MIN;
-    for i in 0..n {
+    let mut max_logit = logits[0];
+    for i in 1..n {
         max_logit = max_logit.max(logits[i]);
     }
 
@@ -408,31 +409,24 @@ impl<'a> LLaMA2<'a> {
         let freq_cis_real_offset = pos * self.config.head_size / 2;
         let freq_cis_imag_offset = pos * self.config.head_size / 2;
 
-        for h in 0..self.config.n_heads {
-            let q = &mut self.q[h * self.config.head_size..];
-            let k = &mut self.k[h * self.config.head_size..];
+        // rotate q and k by the freq_cis_real and freq_cis_imag
+        // For more information checkout the Roformer paper,
+        // section 3.4.2: https://arxiv.org/pdf/2104.09864.pdf
+        for i in (0..self.config.dim).step_by(2) {
+            let q0 = self.q[i];
+            let q1 = self.q[i + 1];
 
-            // rotate q and k by the freq_cis_real and freq_cis_imag
-            // For more information checkout the Roformer paper,
-            // section 3.4.2: https://arxiv.org/pdf/2104.09864.pdf
-            for i in (0..self.config.head_size).step_by(2) {
-                let cos = self.transformer.freq_cis_real[freq_cis_real_offset + i / 2];
-                let sin = self.transformer.freq_cis_imag[freq_cis_imag_offset + i / 2];
+            let k0 = self.k[i];
+            let k1 = self.k[i + 1];
+            
+            let cos = self.transformer.freq_cis_real[freq_cis_real_offset + (i % self.config.head_size) / 2];
+            let sin = self.transformer.freq_cis_imag[freq_cis_imag_offset + (i % self.config.head_size) / 2];
 
-                // Query vector
-                let q0 = q[i];
-                let q1 = q[i + 1];
+            self.q[i] = q0 * cos - q1 * sin;
+            self.q[i + 1] = q1 * cos + q0 * sin;
 
-                q[i] = q0 * cos - q1 * sin;
-                q[i + 1] = q1 * cos + q0 * sin;
-
-                // Key vector
-                let k0 = k[i];
-                let k1 = k[i + 1];
-
-                k[i] = k0 * cos - k1 * sin;
-                k[i + 1] = k1 * cos + k0 * sin;
-            }
+            self.k[i] = k0 * cos - k1 * sin;
+            self.k[i + 1] = k1 * cos + k0 * sin;
         }
     }
 
@@ -474,8 +468,9 @@ impl<'a> LLaMA2<'a> {
                 attn_scores[t] = inner_product(q, key_vector) / sqrt_d;
             }
 
+            // softmax the scores to get attention weights, from 0..pos inclusively
             // Compute temp2 = softmax(temp)
-            softmax(&mut attn_scores, self.config.head_size);
+            softmax(&mut attn_scores, pos + 1);
 
             // Compute temp2^T * V
             let xb_from = h * self.config.head_size;
@@ -583,7 +578,7 @@ impl<'a> LLaMA2<'a> {
         rmsnorm_with_dest(
             self.xb.as_mut_slice(),
             self.x.as_slice(),
-            &self.transformer.rms_ffn_weight
+            &self.transformer.rms_att_weight
                 [layer * self.config.dim..(layer + 1) * self.config.dim],
             self.config.dim,
         );
@@ -644,12 +639,12 @@ impl<'a> LLaMA2<'a> {
 
     fn generate(&mut self, prompt: Option<&str>, n_tokens: usize, temperature: f32) -> Vec<usize> {
         let mut tokens = vec![];
-        tokens.reserve(n_tokens + 1);
+        tokens.reserve(n_tokens);
 
         let mut token = BOS_TOKEN;
         tokens.push(token);
 
-        for pos in 0..n_tokens {
+        for pos in 0..(n_tokens-1) {
             self.forward(token, pos);
 
             if temperature == 0.0 {
@@ -658,10 +653,9 @@ impl<'a> LLaMA2<'a> {
                 // Apply temperature and then sample.
                 // If temperature < 1.0 then the distribution becomes more peaked ==> lower variance in sampling
                 // If temperature > 1.0 then the distribution becomes more flat ==> higher variance in sampling
-                let mut probs = self.logits.clone();
-                probs.iter_mut().for_each(|p| *p = *p / temperature);
-                
-                token = sample(probs.as_slice());
+                self.logits.iter_mut().for_each(|p| *p = *p / temperature);
+                softmax(&mut self.logits.as_mut_slice(), self.config.vocab_size);
+                token = sample(self.logits.as_slice());
             }
             
             tokens.push(token);
@@ -673,6 +667,9 @@ impl<'a> LLaMA2<'a> {
 
 fn main() -> Result<()> {
     let file_path = "weights/stories15M.bin";
+    let prompt: Option<&str> = None;
+    let temperature = 0.0;
+    let steps = 256;
 
     // Setup
 
@@ -691,10 +688,14 @@ fn main() -> Result<()> {
     // Inference
 
     let mut llama2 = LLaMA2::new(&transformer_weights, &config, &vocab);
-    let generated_tokens = llama2.generate(None, 100, 0.0);
-    
+    let generated_tokens = llama2.generate(prompt, steps, temperature);
+
     for token in generated_tokens {
-        print!("{} ", vocab.get_word(token));
+        if token == 1 && vocab.get_word(token).starts_with(' ') {
+            print!("{}", &vocab.get_word(token)[1..]);
+        } else {
+            print!("{}", vocab.get_word(token));
+        };
     }
 
     Ok(())
