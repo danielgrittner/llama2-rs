@@ -9,6 +9,7 @@ TODOs:
 - [X] Implement generation
 - [X] Implement tokens/sec
 - [ ] Support prompting and tokenization
+- [ ] Command line args
 - [X] Parallelize implementation
 - [ ] Optimize performance (SIMD/vectorization, fuse loops etc.)
 - [ ] (Maybe) Quantization
