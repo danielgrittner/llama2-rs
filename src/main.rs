@@ -2,7 +2,7 @@ use byteorder::ByteOrder;
 use memmap2::Mmap;
 use rand::Rng;
 use rayon::iter::ParallelIterator;
-use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator};
+use rayon::prelude::{IndexedParallelIterator, IntoParallelRefMutIterator};
 use rayon::slice::ParallelSliceMut;
 use std::fs::File;
 use std::io::{BufReader, Read, Result};
@@ -357,10 +357,7 @@ struct LLaMA2<'a> {
 }
 
 impl<'a> LLaMA2<'a> {
-    fn new(
-        transformer: &'a TransformerWeights,
-        config: &'a Config,
-    ) -> LLaMA2<'a> {
+    fn new(transformer: &'a TransformerWeights, config: &'a Config) -> LLaMA2<'a> {
         Self {
             x: vec![0.0; config.dim],
             xb: vec![0.0; config.dim],
@@ -460,7 +457,7 @@ impl<'a> LLaMA2<'a> {
             .for_each(|(h, (attn_scores, xb))| {
                 assert_eq!(attn_scores.len(), self.config.seq_len);
                 assert_eq!(xb.len(), self.config.head_size);
-                
+
                 // get query vector of the timestep pos for the current head
                 let q_from = h * self.config.head_size;
                 let q_to = (h + 1) * self.config.head_size;
