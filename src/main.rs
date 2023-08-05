@@ -1,9 +1,13 @@
 use byteorder::ByteOrder;
 use memmap2::Mmap;
+use rand::Rng;
+use rayon::iter::ParallelIterator;
+use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator};
+use rayon::slice::ParallelSliceMut;
 use std::fs::File;
 use std::io::{BufReader, Read, Result};
 use std::iter::zip;
-use rand::Rng;
+use std::time::Instant;
 
 const BOS_TOKEN: usize = 1;
 
@@ -293,13 +297,12 @@ fn softmax(logits: &mut [f32], n: usize) {
 // (out_dim, in_dim) @ (d,) -> (out_dim,)
 // w @ x -> target
 fn matmul(target: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
-    // TODO: parallelize loop
-    (0..out_dim).into_iter().for_each(|i| {
-        target[i] = 0.0;
+    target.par_iter_mut().enumerate().for_each(|(i, t)| {
         let row_offset = i * in_dim;
-        for j in 0..in_dim {
-            target[i] += w[row_offset + j] * x[j];
-        }
+        *t = x
+            .iter()
+            .zip(w[row_offset..].iter())
+            .fold(0.0, |result, (x, w)| result + x * w);
     });
 }
 
@@ -354,7 +357,10 @@ struct LLaMA2<'a> {
 }
 
 impl<'a> LLaMA2<'a> {
-    fn new(transformer: &'a TransformerWeights, config: &'a Config, vocab: &'a Vocab) -> LLaMA2<'a> {
+    fn new(
+        transformer: &'a TransformerWeights,
+        config: &'a Config,
+    ) -> LLaMA2<'a> {
         Self {
             x: vec![0.0; config.dim],
             xb: vec![0.0; config.dim],
@@ -418,9 +424,11 @@ impl<'a> LLaMA2<'a> {
 
             let k0 = self.k[i];
             let k1 = self.k[i + 1];
-            
-            let cos = self.transformer.freq_cis_real[freq_cis_real_offset + (i % self.config.head_size) / 2];
-            let sin = self.transformer.freq_cis_imag[freq_cis_imag_offset + (i % self.config.head_size) / 2];
+
+            let cos = self.transformer.freq_cis_real
+                [freq_cis_real_offset + (i % self.config.head_size) / 2];
+            let sin = self.transformer.freq_cis_imag
+                [freq_cis_imag_offset + (i % self.config.head_size) / 2];
 
             self.q[i] = q0 * cos - q1 * sin;
             self.q[i + 1] = q1 * cos + q0 * sin;
@@ -442,56 +450,55 @@ impl<'a> LLaMA2<'a> {
 
     fn multihead_attn(&mut self, layer: usize, pos: usize) {
         let layer_offset_for_cache = layer * self.config.seq_len * self.config.dim; // offset to get to the cache of the current layer
-        
+
         let sqrt_d = (self.config.head_size as f32).sqrt();
-        
-        // TODO: parallelize loop
-        (0..self.config.n_heads).into_iter().for_each(|h| {
-            // get reference to the attention scores slice for the current head
-            let attn_scores_from = h * self.config.seq_len;
-            let attn_scores_to = (h + 1) * self.config.seq_len;
-            let mut attn_scores = &mut self.att[attn_scores_from..attn_scores_to];
 
-            // get query vector of the timestep pos for the current head
-            let q_from = h * self.config.head_size;
-            let q_to = (h + 1) * self.config.head_size;
-            let q = &self.q[q_from..q_to];
+        self.att
+            .par_chunks_exact_mut(self.config.seq_len)
+            .zip(self.xb.par_chunks_exact_mut(self.config.head_size))
+            .enumerate()
+            .for_each(|(h, (attn_scores, xb))| {
+                assert_eq!(attn_scores.len(), self.config.seq_len);
+                assert_eq!(xb.len(), self.config.head_size);
+                
+                // get query vector of the timestep pos for the current head
+                let q_from = h * self.config.head_size;
+                let q_to = (h + 1) * self.config.head_size;
+                let q = &self.q[q_from..q_to];
 
-            // Compute temp = (K * q_pos) / sqrt(dim)
-            for t in 0..=pos {
-                let timestep_and_layer_offset = layer_offset_for_cache + t * self.config.dim; // key_cache[l, t]
-                // for the current key, we need to select the correct range which corresponds to the current head
-                let key_vector_from = timestep_and_layer_offset + h * self.config.head_size;
-                let key_vector_to = timestep_and_layer_offset + (h + 1) * self.config.head_size;
-                let key_vector = &self.key_cache[key_vector_from..key_vector_to];
+                // Compute temp = (K * q_pos) / sqrt(dim)
+                for t in 0..=pos {
+                    let timestep_and_layer_offset = layer_offset_for_cache + t * self.config.dim; // key_cache[l, t]
+                                                                                                  // for the current key, we need to select the correct range which corresponds to the current head
+                    let key_vector_from = timestep_and_layer_offset + h * self.config.head_size;
+                    let key_vector_to = timestep_and_layer_offset + (h + 1) * self.config.head_size;
+                    let key_vector = &self.key_cache[key_vector_from..key_vector_to];
 
-                attn_scores[t] = inner_product(q, key_vector) / sqrt_d;
-            }
-
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            // Compute temp2 = softmax(temp)
-            softmax(&mut attn_scores, pos + 1);
-
-            // Compute temp2^T * V
-            let xb_from = h * self.config.head_size;
-            let xb_to = (h + 1) * self.config.head_size;
-            let xb = &mut self.xb[xb_from..xb_to];
-            xb.fill(0.0);
-
-            for t in 0..=pos {
-                let timestep_and_layer_offset = layer_offset_for_cache + t * self.config.dim; // value_cache[l, t]
-                // for the current value, we need to select the correct range which corresponds to the current head
-                let value_vector_from = timestep_and_layer_offset + h * self.config.head_size;
-                let value_vector_to = timestep_and_layer_offset + (h + 1) * self.config.head_size;
-                let value_vector = &self.value_cache[value_vector_from..value_vector_to];
-
-                // weighted sum with attention scores as weights
-                let attention_weight = attn_scores[t];
-                for i in 0..self.config.head_size {
-                    xb[i] += attention_weight * value_vector[i];
+                    attn_scores[t] = inner_product(q, key_vector) / sqrt_d;
                 }
-            }
-        });
+
+                // softmax the scores to get attention weights, from 0..pos inclusively
+                // Compute temp2 = softmax(temp)
+                softmax(attn_scores, pos + 1);
+
+                // Compute temp2^T * V
+                xb.fill(0.0);
+
+                for t in 0..=pos {
+                    let timestep_and_layer_offset = layer_offset_for_cache + t * self.config.dim; // value_cache[l, t]
+                                                                                                  // for the current value, we need to select the correct range which corresponds to the current head
+                    let value_vector_from = timestep_and_layer_offset + h * self.config.head_size;
+                    let value_vector_to =
+                        timestep_and_layer_offset + (h + 1) * self.config.head_size;
+                    let value_vector = &self.value_cache[value_vector_from..value_vector_to];
+
+                    // weighted sum with attention scores as weights
+                    let attention_weight = attn_scores[t];
+                    for i in 0..self.config.head_size {
+                        xb[i] += attention_weight * value_vector[i];
+                    }
+                }
+            });
     }
 
     // multi-head attention with RoPE
@@ -505,7 +512,7 @@ impl<'a> LLaMA2<'a> {
 
         // Multi-head attention with caching
         // Idea:
-        // 
+        //
         // Let the current sequence length until the current timestep pos be n.
         // The idea is to only compute the attention score for the token at timestep pos.
         // Therefore, we compute for each head:
@@ -644,7 +651,7 @@ impl<'a> LLaMA2<'a> {
         let mut token = BOS_TOKEN;
         tokens.push(token);
 
-        for pos in 0..(n_tokens-1) {
+        for pos in 0..(n_tokens - 1) {
             self.forward(token, pos);
 
             if temperature == 0.0 {
@@ -657,7 +664,7 @@ impl<'a> LLaMA2<'a> {
                 softmax(&mut self.logits.as_mut_slice(), self.config.vocab_size);
                 token = sample(self.logits.as_slice());
             }
-            
+
             tokens.push(token);
         }
 
@@ -685,10 +692,25 @@ fn main() -> Result<()> {
 
     println!("Done.");
 
+    // Configure rayon
+
+    let cpus = num_cpus::get();
+    let active_cpus = (cpus).max(1).min(config.n_heads);
+    println!("Using {} threads", active_cpus);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(active_cpus)
+        .build_global()
+        .unwrap();
+
     // Inference
 
-    let mut llama2 = LLaMA2::new(&transformer_weights, &config, &vocab);
+    let start = Instant::now();
+    let mut llama2 = LLaMA2::new(&transformer_weights, &config);
     let generated_tokens = llama2.generate(prompt, steps, temperature);
+
+    let time_elapsed = start.elapsed().as_secs_f32();
+    let tokens_per_sec = (steps as f32) / time_elapsed;
+    println!("tokens / seconds = {:.2?}", tokens_per_sec);
 
     for token in generated_tokens {
         if token == 1 && vocab.get_word(token).starts_with(' ') {
