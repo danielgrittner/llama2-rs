@@ -3,6 +3,9 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::io::{BufReader, Read, Result};
 use std::iter::zip;
+use rand::Rng;
+
+const BOS_TOKEN: usize = 1;
 
 type RawConfigI32 = [i32; 7];
 
@@ -292,7 +295,7 @@ fn matmul(target: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usiz
     // TODO: parallelize loop
     (0..out_dim).into_iter().for_each(|i| {
         target[i] = 0.0;
-        let row_offset = i * out_dim;
+        let row_offset = i * in_dim;
         for j in 0..in_dim {
             target[i] += w[row_offset + j] * x[j];
         }
@@ -301,6 +304,31 @@ fn matmul(target: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usiz
 
 fn inner_product(x: &[f32], y: &[f32]) -> f32 {
     zip(x, y).fold(0.0, |acc, (a, b)| acc + a * b)
+}
+
+fn argmax(x: &[f32]) -> usize {
+    let mut max = std::f32::MIN;
+    let mut argmax = 0;
+    for (i, v) in x.iter().enumerate() {
+        if *v > max {
+            max = *v;
+            argmax = i;
+        }
+    }
+    argmax
+}
+
+fn sample(probs: &[f32]) -> usize {
+    let mut rng = rand::thread_rng();
+    let mut cdf = 0.0;
+    let r = rng.gen_range(0.0..1.0);
+    for (i, p) in probs.iter().enumerate() {
+        cdf += p;
+        if cdf > r {
+            return i;
+        }
+    }
+    probs.len() - 1
 }
 
 #[derive(Debug)]
@@ -325,7 +353,7 @@ struct LLaMA2<'a> {
 }
 
 impl<'a> LLaMA2<'a> {
-    fn new(transformer: &'a TransformerWeights, config: &'a Config) -> LLaMA2<'a> {
+    fn new(transformer: &'a TransformerWeights, config: &'a Config, vocab: &'a Vocab) -> LLaMA2<'a> {
         Self {
             x: vec![0.0; config.dim],
             xb: vec![0.0; config.dim],
@@ -535,7 +563,6 @@ impl<'a> LLaMA2<'a> {
 
         // PyTorch: x = F.silu(self.w1(x)) * self.w3(x)
         // Note: Fused the activation and elementwise multiplication loop
-        // TODO: benchmark in llama2.c the effect of this loop fusion
         for i in 0..self.config.hidden_dim {
             self.hb[i] = silu(self.hb[i]) * self.hb2[i];
         }
@@ -614,14 +641,44 @@ impl<'a> LLaMA2<'a> {
             self.config.dim,
         );
     }
+
+    fn generate(&mut self, prompt: Option<&str>, n_tokens: usize, temperature: f32) -> Vec<usize> {
+        let mut tokens = vec![];
+        tokens.reserve(n_tokens + 1);
+
+        let mut token = BOS_TOKEN;
+        tokens.push(token);
+
+        for pos in 0..n_tokens {
+            self.forward(token, pos);
+
+            if temperature == 0.0 {
+                token = argmax(self.logits.as_slice());
+            } else {
+                // Apply temperature and then sample.
+                // If temperature < 1.0 then the distribution becomes more peaked ==> lower variance in sampling
+                // If temperature > 1.0 then the distribution becomes more flat ==> higher variance in sampling
+                let mut probs = self.logits.clone();
+                probs.iter_mut().for_each(|p| *p = *p / temperature);
+                
+                token = sample(probs.as_slice());
+            }
+            
+            tokens.push(token);
+        }
+
+        tokens
+    }
 }
 
 fn main() -> Result<()> {
     let file_path = "weights/stories15M.bin";
 
+    // Setup
+
     println!("Loading config...");
     let config = Config::from_file(file_path)?;
-    println!("{:?}", config);
+    println!("Loaded config: {:?}", config);
 
     println!("Loading vocab...");
     let vocab = Vocab::from_file("tokenizer.bin", config.vocab_size as usize)?;
@@ -631,9 +688,14 @@ fn main() -> Result<()> {
 
     println!("Done.");
 
-    // TODO: set up inference state
+    // Inference
 
-    // TODO: forward pass
+    let mut llama2 = LLaMA2::new(&transformer_weights, &config, &vocab);
+    let generated_tokens = llama2.generate(None, 100, 0.0);
+    
+    for token in generated_tokens {
+        print!("{} ", vocab.get_word(token));
+    }
 
     Ok(())
 }
