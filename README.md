@@ -7,7 +7,8 @@ TODOs:
 - [X] Implement loading of the model
 - [X] Implement forward pass
 - [X] Implement generation
-- [ ] Implement benchmarking
+- [X] Implement tokens/sec
 - [ ] Support prompting and tokenization
-- [ ] Optimize performance (parallelization, SIMD/vectorization, fuse loops etc.)
+- [X] Parallelize implementation
+- [ ] Optimize performance (SIMD/vectorization, fuse loops etc.)
 - [ ] (Maybe) Quantization
