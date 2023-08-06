@@ -82,7 +82,6 @@ impl Vocab {
         let mut vocab = Vocab::default();
         vocab.vocab.reserve(vocab_size);
 
-        // TODO: use mmap
         let file = File::open(tokenizer_file_path)?;
         let mut reader = BufReader::new(file);
 
@@ -235,46 +234,71 @@ impl TransformerWeights {
             wcls,
         })
     }
-}
 
-// TODO: I think passing the size as parameter is not necessary since slice supports len()
+    // Note: does not include the token embedding table
+    fn num_parameters(&self) -> usize {
+        let mut n = 0;
+        n += self.rms_att_weight.len();
+        n += self.wq.len();
+        n += self.wk.len();
+        n += self.wv.len();
+        n += self.wo.len();
+        n += self.rms_ffn_weight.len();
+        n += self.w1.len();
+        n += self.w2.len();
+        n += self.w3.len();
+        n += self.rms_final_weights.len();
+        n += self.freq_cis_real.len();
+        n += self.freq_cis_imag.len();
+        n += self.wcls.len();
+        n
+    }
+
+    fn memory_usage_in_bytes(&self) -> usize {
+        (self.num_parameters() + self.token_embedding_table.len()) * std::mem::size_of::<f32>()
+    }
+}
 
 // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-fn add_vectors(target: &mut [f32], source: &[f32], n: usize) {
-    for i in 0..n {
-        target[i] += source[i];
-    }
+fn add_vectors(target: &mut [f32], source: &[f32]) {
+    target
+        .iter_mut()
+        .zip(source.iter())
+        .for_each(|(t, s)| *t += s);
 }
 
-fn rmsnorm(x: &mut [f32], weight: &[f32], n: usize) {
-    let mut squared_sum = 0.0;
-    for i in 0..n {
-        squared_sum += x[i] * x[i];
-    }
-    let rms = 1. / (squared_sum / n as f32).sqrt();
+fn rmsnorm(x: &mut [f32], weight: &[f32]) {
+    let size = x.len();
 
-    for i in 0..n {
-        x[i] = x[i] * rms * weight[i];
-    }
+    let squared_sum = x.iter().fold(0.0, |acc, x| acc + x * x);
+    let rms = 1. / (squared_sum / size as f32).sqrt();
+
+    x.iter_mut()
+        .zip(weight.iter())
+        .for_each(|(x, w)| *x *= rms * w);
 }
 
-fn rmsnorm_with_dest(dest: &mut [f32], x: &[f32], weight: &[f32], n: usize) {
-    let mut squared_sum = 0.0;
-    for i in 0..n {
-        squared_sum += x[i] * x[i];
-    }
-    let rms = 1. / (squared_sum / n as f32 + 1e-5 as f32).sqrt();
+fn rmsnorm_with_dest(dest: &mut [f32], x: &[f32], weight: &[f32]) {
+    let size = x.len();
 
-    for i in 0..n {
-        dest[i] = x[i] * rms * weight[i];
-    }
+    let squared_sum = x.iter().fold(0.0, |acc, x| acc + x * x);
+    let rms = 1. / (squared_sum / size as f32).sqrt();
+
+    dest.iter_mut()
+        .zip(x.iter())
+        .zip(weight.iter())
+        .for_each(|((d, x), w)| {
+            *d = x * rms * w;
+        });
 }
 
-fn softmax(logits: &mut [f32], n: usize) {
+fn softmax(logits: &mut [f32]) {
+    let n = logits.len();
+
     // Find max. for fixing stability
     let mut max_logit = logits[0];
     for i in 1..n {
@@ -296,7 +320,8 @@ fn softmax(logits: &mut [f32], n: usize) {
 
 // (out_dim, in_dim) @ (d,) -> (out_dim,)
 // w @ x -> target
-fn matmul(target: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
+fn matmul(target: &mut [f32], w: &[f32], x: &[f32]) {
+    let in_dim = x.len();
     target.par_iter_mut().enumerate().for_each(|(i, t)| {
         let row_offset = i * in_dim;
         *t = x
@@ -385,24 +410,18 @@ impl<'a> LLaMA2<'a> {
             self.q.as_mut_slice(),                        // out: (dim,)
             &self.transformer.wq[weight_from..weight_to], // W: (dim, dim)
             self.xb.as_slice(),                           // x: (dim,)
-            self.config.dim,
-            self.config.dim,
         );
 
         matmul(
             self.k.as_mut_slice(),                        // out: (dim,)
             &self.transformer.wk[weight_from..weight_to], // W: (dim, dim)
             self.xb.as_slice(),                           // x: (dim,)
-            self.config.dim,
-            self.config.dim,
         );
 
         matmul(
             self.v.as_mut_slice(),                        // out: (dim,)
             &self.transformer.wv[weight_from..weight_to], // W: (dim, dim)
             self.xb.as_slice(),                           // x: (dim,)
-            self.config.dim,
-            self.config.dim,
         );
     }
 
@@ -476,7 +495,7 @@ impl<'a> LLaMA2<'a> {
 
                 // softmax the scores to get attention weights, from 0..pos inclusively
                 // Compute temp2 = softmax(temp)
-                softmax(attn_scores, pos + 1);
+                softmax(&mut attn_scores[..(pos + 1)]);
 
                 // Compute temp2^T * V
                 xb.fill(0.0);
@@ -532,8 +551,6 @@ impl<'a> LLaMA2<'a> {
             self.xb2.as_mut_slice(),                      // out: (dim,)
             &self.transformer.wo[weight_from..weight_to], // W: (dim, dim)
             self.xb.as_slice(),                           // x: (dim,)
-            self.config.dim,
-            self.config.dim,
         );
     }
 
@@ -547,8 +564,6 @@ impl<'a> LLaMA2<'a> {
             self.hb.as_mut_slice(),                       // out: (hidden_dim,)
             &self.transformer.w1[weight_from..weight_to], // W: (hidden_dim, dim)
             self.xb.as_slice(),                           // x: (dim,)
-            self.config.hidden_dim,
-            self.config.dim,
         );
 
         // PyTorch: self.w3(x)
@@ -556,8 +571,6 @@ impl<'a> LLaMA2<'a> {
             self.hb2.as_mut_slice(),                      // out: (hidden_dim,)
             &self.transformer.w3[weight_from..weight_to], // W: (hidden_dim, dim)
             self.xb.as_slice(),                           // x: (dim,)
-            self.config.hidden_dim,
-            self.config.dim,
         );
 
         // PyTorch: x = F.silu(self.w1(x)) * self.w3(x)
@@ -571,8 +584,6 @@ impl<'a> LLaMA2<'a> {
             self.xb.as_mut_slice(),                       // out: (hidden_dim,)
             &self.transformer.w2[weight_from..weight_to], // W: (hidden_dim, dim)
             self.hb.as_slice(),                           // x: (dim,)
-            self.config.dim,
-            self.config.hidden_dim,
         );
     }
 
@@ -584,11 +595,10 @@ impl<'a> LLaMA2<'a> {
             self.x.as_slice(),
             &self.transformer.rms_att_weight
                 [layer * self.config.dim..(layer + 1) * self.config.dim],
-            self.config.dim,
         );
         self.attn(layer, pos);
         // residual connection
-        add_vectors(self.x.as_mut_slice(), self.xb2.as_slice(), self.config.dim);
+        add_vectors(self.x.as_mut_slice(), self.xb2.as_slice());
 
         // PyTorch: out = h + self.feed_forward.forward(self.ffn_norm(h))
         // Note: we leave the buffer x as it is because we need it for the residual connection
@@ -597,11 +607,10 @@ impl<'a> LLaMA2<'a> {
             self.x.as_slice(),
             &self.transformer.rms_ffn_weight
                 [layer * self.config.dim..(layer + 1) * self.config.dim],
-            self.config.dim,
         );
         self.ffn(layer);
         // residual connection
-        add_vectors(self.x.as_mut_slice(), self.xb.as_slice(), self.config.dim);
+        add_vectors(self.x.as_mut_slice(), self.xb.as_slice());
     }
 
     fn forward(&mut self, token: usize, pos: usize) {
@@ -627,7 +636,6 @@ impl<'a> LLaMA2<'a> {
         rmsnorm(
             self.x.as_mut_slice(),
             self.transformer.rms_final_weights.as_slice(),
-            self.config.dim,
         );
 
         // generate logits, i.e., map activations from dim to vocab_size
@@ -636,8 +644,6 @@ impl<'a> LLaMA2<'a> {
             self.logits.as_mut_slice(),       // out: (vocab_size,)
             self.transformer.wcls.as_slice(), // W: (vocab_size, dim)
             self.x.as_slice(),                // x: (dim,)
-            self.config.vocab_size,
-            self.config.dim,
         );
     }
 
@@ -658,7 +664,7 @@ impl<'a> LLaMA2<'a> {
                 // If temperature < 1.0 then the distribution becomes more peaked ==> lower variance in sampling
                 // If temperature > 1.0 then the distribution becomes more flat ==> higher variance in sampling
                 self.logits.iter_mut().for_each(|p| *p = *p / temperature);
-                softmax(&mut self.logits.as_mut_slice(), self.config.vocab_size);
+                softmax(&mut self.logits.as_mut_slice());
                 token = sample(self.logits.as_slice());
             }
 
@@ -666,6 +672,27 @@ impl<'a> LLaMA2<'a> {
         }
 
         tokens
+    }
+
+    fn memory_usage_in_bytes(&self) -> usize {
+        let mut memory_usage = 0;
+
+        memory_usage += self.x.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.xb.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.xb2.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.hb.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.hb2.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.q.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.k.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.v.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.att.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.logits.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.key_cache.capacity() * std::mem::size_of::<f32>();
+        memory_usage += self.value_cache.capacity() * std::mem::size_of::<f32>();
+
+        memory_usage += self.transformer.memory_usage_in_bytes();
+
+        memory_usage
     }
 }
 
@@ -689,6 +716,11 @@ fn main() -> Result<()> {
 
     println!("Done.");
 
+    println!(
+        "Number of parameters: {}",
+        transformer_weights.num_parameters()
+    );
+
     // Configure rayon
 
     let cpus = num_cpus::get();
@@ -703,6 +735,10 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
     let mut llama2 = LLaMA2::new(&transformer_weights, &config);
+
+    let llama_memory_mib = llama2.memory_usage_in_bytes() as f32 / ((1 as usize) << 20) as f32;
+    println!("Memory usage in MiB: {llama_memory_mib}");
+
     let generated_tokens = llama2.generate(prompt, steps, temperature);
 
     let time_elapsed = start.elapsed().as_secs_f32();
