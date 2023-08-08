@@ -4,6 +4,7 @@ use rand::Rng;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefMutIterator};
 use rayon::slice::ParallelSliceMut;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Result};
 use std::iter::zip;
@@ -61,46 +62,116 @@ impl Config {
     }
 }
 
-fn read_n<R>(reader: R, bytes_to_read: u64) -> Result<Vec<u8>>
+fn read_n<R>(reader: R, bytes_to_read: usize) -> Result<Vec<u8>>
 where
     R: Read,
 {
     let mut buf = vec![];
-    let mut chunk = reader.take(bytes_to_read);
+    let mut chunk = reader.take(bytes_to_read as u64);
     let n = chunk.read_to_end(&mut buf)?;
-    assert_eq!(bytes_to_read as usize, n);
+    assert_eq!(bytes_to_read, n);
     Ok(buf)
 }
 
 #[derive(Debug, Default)]
-struct Vocab {
+struct Tokenizer {
+    vocab_scores: Vec<f32>,
     vocab: Vec<String>,
+    word_to_token_id: HashMap<String, usize>,
+    max_token_length: usize,
 }
 
-impl Vocab {
-    fn from_file(tokenizer_file_path: &str, vocab_size: usize) -> Result<Self> {
-        let mut vocab = Vocab::default();
+impl Tokenizer {
+    fn from_file(tokenizer_file_path: &str, vocab_size: usize) -> Result<Tokenizer> {
+        let mut vocab = Tokenizer::default();
+        vocab.vocab_scores.reserve(vocab_size);
         vocab.vocab.reserve(vocab_size);
 
         let file = File::open(tokenizer_file_path)?;
         let mut reader = BufReader::new(file);
 
+        // Read max_token_length
+        let max_token_length_buffer = read_n(&mut reader, std::mem::size_of::<u32>())?;
+        vocab.max_token_length = byteorder::LittleEndian::read_u32(&max_token_length_buffer) as usize;
+
         for _ in 0..vocab_size {
+            // Read vocab score
+            let vocab_score_buffer = read_n(&mut reader, std::mem::size_of::<f32>())?;
+            let score = byteorder::LittleEndian::read_f32(&vocab_score_buffer);
+            vocab.vocab_scores.push(score);
+
             // Read length from file stream
-            let length_buffer = read_n(&mut reader, std::mem::size_of::<i32>() as u64)?;
+            let length_buffer = read_n(&mut reader, std::mem::size_of::<i32>())?;
             let string_length = byteorder::LittleEndian::read_i32(&length_buffer);
 
             // Read string from file stream
-            let string_buffer = read_n(&mut reader, string_length as u64)?;
+            let string_buffer = read_n(&mut reader, string_length as usize)?;
             let string = String::from_utf8(string_buffer).expect("could not read word");
             vocab.vocab.push(string);
         }
 
+        vocab.word_to_token_id.reserve(vocab_size);
+        vocab.vocab.iter().enumerate().for_each(|(token_id, word)| {
+            vocab.word_to_token_id.insert(word.to_string(), token_id);
+        });
+
         Ok(vocab)
     }
 
-    fn get_word(&self, token: usize) -> &str {
-        &self.vocab[token]
+    fn decode(&self, token_id: usize) -> &str {
+        &self.vocab[token_id]
+    }
+
+    fn lookup_word(&self, word: &str) -> Option<usize> {
+        match self.word_to_token_id.get(word) {
+            Some(token_id) => Some(*token_id),
+            None => None
+        }
+    }
+
+    fn bpe_encode(&self, s: &str) -> Vec<usize> {
+        let mut tokens = Vec::new();
+        tokens.reserve(s.len());
+        
+        // encode every individual byte
+        for i in 0..s.len() {
+            let token_id = self.lookup_word(&s[i..i+1]).unwrap();
+            tokens.push(token_id);
+        }
+    
+        let mut str_buffer = String::with_capacity(2 * self.max_token_length);
+    
+        // merge the best consecutive pair each iteration, according the scores in vocab_scores
+        loop {
+            let mut best_score = -1e10;
+            let mut best_token_id = usize::MAX;
+            let mut best_idx = usize::MAX;
+
+            for i in 0..tokens.len() - 1 {
+                // Copy the two consecutive tokens into a single string
+                str_buffer.clear();
+                str_buffer.push_str(&self.vocab[tokens[i]]);
+                str_buffer.push_str(&self.vocab[tokens[i + 1]]);
+                
+                if let Some(token_id) = self.lookup_word(&str_buffer) {
+                    if self.vocab_scores[token_id] > best_score {
+                        best_score = self.vocab_scores[token_id];
+                        best_token_id = token_id;
+                        best_idx = i;
+                    }
+                }
+            }
+
+            if best_idx == usize::MAX {
+                break;
+            }
+
+            // Merge the best pair and delete the second token
+            tokens[best_idx] = best_token_id;
+            tokens.remove(best_idx + 1);
+        }
+
+        tokens
     }
 }
 
@@ -647,14 +718,22 @@ impl<'a> LLaMA2<'a> {
         );
     }
 
-    fn generate(&mut self, prompt: Option<&str>, n_tokens: usize, temperature: f32) -> Vec<usize> {
+    fn generate(&mut self, prompt_tokens: &Vec<usize>, n_tokens: usize, temperature: f32) -> Vec<usize> {
         let mut tokens = vec![];
         tokens.reserve(n_tokens);
 
         let mut token = BOS_TOKEN;
         tokens.push(token);
 
-        for pos in 0..(n_tokens - 1) {
+        // forward through the prompt to fill up the KV-cache!
+        for (pos, prompt_token) in prompt_tokens.iter().enumerate() {
+            self.forward(token, pos);
+            token = *prompt_token;
+            tokens.push(token);
+        }
+
+        // complete the prompt
+        for pos in prompt_tokens.len()..(n_tokens - 1) {
             self.forward(token, pos);
 
             if temperature == 0.0 {
@@ -698,7 +777,7 @@ impl<'a> LLaMA2<'a> {
 
 fn main() -> Result<()> {
     let file_path = "weights/stories15M.bin";
-    let prompt: Option<&str> = None;
+    let prompt = "One day, Lily met a bear";
     let temperature = 0.0;
     let steps = 256;
 
@@ -709,7 +788,7 @@ fn main() -> Result<()> {
     println!("Loaded config: {:?}", config);
 
     println!("Loading vocab...");
-    let vocab = Vocab::from_file("tokenizer.bin", config.vocab_size as usize)?;
+    let tokenizer = Tokenizer::from_file("tokenizer.bin", config.vocab_size as usize)?;
 
     println!("Loading weights...");
     let transformer_weights = TransformerWeights::from_file(file_path, &config)?;
@@ -739,17 +818,19 @@ fn main() -> Result<()> {
     let llama_memory_mib = llama2.memory_usage_in_bytes() as f32 / ((1 as usize) << 20) as f32;
     println!("Memory usage in MiB: {llama_memory_mib}");
 
-    let generated_tokens = llama2.generate(prompt, steps, temperature);
+    let prompt_tokens = tokenizer.bpe_encode(&prompt);
+    let generated_tokens = llama2.generate(&prompt_tokens, steps, temperature);
 
     let time_elapsed = start.elapsed().as_secs_f32();
     let tokens_per_sec = (steps as f32) / time_elapsed;
     println!("tokens / seconds = {:.2?}", tokens_per_sec);
 
+    print!("{}", prompt);
     for token in generated_tokens {
-        if token == 1 && vocab.get_word(token).starts_with(' ') {
-            print!("{}", &vocab.get_word(token)[1..]);
+        if token == 1 && tokenizer.decode(token).starts_with(' ') {
+            print!("{}", &tokenizer.decode(token)[1..]);
         } else {
-            print!("{}", vocab.get_word(token));
+            print!("{}", tokenizer.decode(token));
         };
     }
 

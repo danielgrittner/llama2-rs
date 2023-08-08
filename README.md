@@ -8,11 +8,11 @@ TODOs:
 - [X] Implement forward pass
 - [X] Implement generation
 - [X] Implement tokens/sec
-- [ ] Support prompting and tokenization
+- [X] Support prompting and tokenization
 - [ ] Command line args
 - [X] Parallelize implementation
+- [ ] Support Quantization
 - [ ] Optimize performance (SIMD/vectorization, fuse loops etc.)
-- [ ] (Maybe) Quantization
 
 
 Current Performance on my M1 Pro:
